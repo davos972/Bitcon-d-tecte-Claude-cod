@@ -20,7 +20,7 @@ import { PerformancePanel } from './components/PerformancePanel';
 import { usePrice } from './hooks/usePrice';
 import { useMarkov } from './hooks/useMarkov';
 import { useTracker } from './hooks/useTracker';
-import { TimeFrame, getPhaseInfo } from './utils/cycle';
+import { TimeFrame, CYCLE_SECONDS, getPhaseInfo, getWindowStart } from './utils/cycle';
 
 const TIMEFRAMES: TimeFrame[] = ['15M', '5M', '1H'];
 
@@ -31,17 +31,21 @@ export default function App() {
   // Live price
   const priceState = usePrice();
 
-  // Markov predictions for all 3 TFs (background tracking)
+  // Markov predictions — all 3 TFs always running in background (guide rule #2)
   const markov5M = useMarkov('5M');
   const markov15M = useMarkov('15M');
   const markov1H = useMarkov('1H');
-  const markovByTF = { '5M': markov5M, '15M': markov15M, '1H': markov1H };
+  const markovByTF: Record<TimeFrame, ReturnType<typeof useMarkov>> = {
+    '5M': markov5M,
+    '15M': markov15M,
+    '1H': markov1H,
+  };
   const activeMarkov = markovByTF[activeTab];
 
   // Performance tracker
   const tracker = useTracker();
 
-  // Clock tick every second
+  // Clock: tick every second
   useEffect(() => {
     const interval = setInterval(() => {
       setNow(Math.floor(Date.now() / 1000));
@@ -49,60 +53,106 @@ export default function App() {
     return () => clearInterval(interval);
   }, []);
 
-  // Phase info for active tab
-  const { phase, windowStart, elapsed, remaining, progress } = getPhaseInfo(now, activeTab);
+  // Phase info for the active tab only (display purposes)
+  const { phase, windowStart, remaining, progress } = getPhaseInfo(now, activeTab);
 
-  // --- Price to Beat (3 rules from guide) ---
-  // Rule 1: = open of CURRENT window, never arrival price
-  // Rule 2: recaptured ONLY when windowStart changes
-  // Rule 3: snapshot live price immediately, refine to candle open when available
+  // -------------------------------------------------------------------------
+  // Price to Beat — 3 rules from the guide
+  // Rule 1: = open of the CURRENT window, never the price when user opens app
+  // Rule 2: recaptured ONLY when windowStart changes (not on every render)
+  // Rule 3: snapshot live price immediately, then refine to exact candle open
+  // -------------------------------------------------------------------------
+  const [priceToBeat, setPriceToBeat] = useState<number | null>(null);
   const priceToBeatRef = useRef<number | null>(null);
   const windowOpenTsRef = useRef<number>(0);
-  const [priceToBeat, setPriceToBeat] = useState<number | null>(null);
+  const priceInitializedRef = useRef(false);
 
+  // Trigger: window boundary changed → capture new open price (Rule 2)
   useEffect(() => {
     if (windowStart !== windowOpenTsRef.current) {
       windowOpenTsRef.current = windowStart;
-      // Snapshot live price immediately (Rule 3a)
       if (priceState.price !== null) {
         priceToBeatRef.current = priceState.price;
         setPriceToBeat(priceState.price);
+        priceInitializedRef.current = true;
       }
     }
-  }, [windowStart]); // Only triggers on window boundary change (Rule 2)
+  }, [windowStart]);
 
-  // Refine Price to Beat with exact candle open once it appears in history (Rule 3b)
+  // Trigger: price arrives for the first time before first window boundary
   useEffect(() => {
     if (
-      activeMarkov.data?.current_window_open !== null &&
-      activeMarkov.data?.current_window_open !== undefined &&
-      windowOpenTsRef.current === activeMarkov.windowStart
+      priceState.price !== null &&
+      !priceInitializedRef.current &&
+      windowOpenTsRef.current > 0
     ) {
-      const exactOpen = activeMarkov.data.current_window_open;
-      if (exactOpen !== priceToBeatRef.current) {
-        priceToBeatRef.current = exactOpen;
-        setPriceToBeat(exactOpen);
+      priceToBeatRef.current = priceState.price;
+      setPriceToBeat(priceState.price);
+      priceInitializedRef.current = true;
+    }
+  }, [priceState.price]);
+
+  // Initialise windowOpenTsRef on mount so the price trigger above works
+  useEffect(() => {
+    const ws = getWindowStart(Math.floor(Date.now() / 1000), activeTab);
+    if (windowOpenTsRef.current === 0) {
+      windowOpenTsRef.current = ws;
+    }
+  }, []);
+
+  // Rule 3b: refine to exact candle open once historical data has it
+  useEffect(() => {
+    const d = activeMarkov.data;
+    if (
+      d?.current_window_open != null &&
+      activeMarkov.windowStart === windowOpenTsRef.current
+    ) {
+      const exact = d.current_window_open;
+      if (exact !== priceToBeatRef.current) {
+        priceToBeatRef.current = exact;
+        setPriceToBeat(exact);
       }
     }
   }, [activeMarkov.data?.current_window_open, activeMarkov.windowStart]);
 
-  // --- Record predictions ---
-  // For each TF, record a prediction during ANALYSIS phase if we have edge
+  // -------------------------------------------------------------------------
+  // Close price tracking — one ref per TF, detects window transitions
+  // Used to provide local scoring data to the tracker (needed for 1H)
+  // -------------------------------------------------------------------------
+  const prevWindowsRef = useRef<Partial<Record<TimeFrame, number>>>({});
+
+  useEffect(() => {
+    for (const tf of TIMEFRAMES) {
+      const ws = getWindowStart(now, tf);
+      const prev = prevWindowsRef.current[tf];
+      if (prev !== undefined && ws !== prev) {
+        // The previous window just closed — pass close price to tracker
+        if (priceState.price !== null) {
+          tracker.updateClosePrice(tf, prev, priceState.price);
+        }
+      }
+      prevWindowsRef.current[tf] = ws;
+    }
+  }, [now]);
+
+  // -------------------------------------------------------------------------
+  // Record predictions (once per window, during ANALYSIS, only if edge exists)
+  // Freshness check is also required here — bug #9 fix from the guide
+  // -------------------------------------------------------------------------
   const recordedRef = useRef<Partial<Record<TimeFrame, number>>>({});
 
   useEffect(() => {
-    const recordForTF = (tf: TimeFrame) => {
+    for (const tf of TIMEFRAMES) {
       const m = markovByTF[tf];
       const { windowStart: ws, phase: p } = getPhaseInfo(now, tf);
 
-      if (p !== 'ANALYSIS') return;
-      if (m.status !== 'ok' || !m.data || m.noEdge) return;
-      if (!m.isFresh) return; // Never record stale predictions (bug #9 fix)
-      if (m.data.direction === 'NONE') return;
-      if (recordedRef.current[tf] === ws) return; // Anti-duplicate
-
-      const price = priceState.price;
-      if (!price) return;
+      if (p !== 'ANALYSIS') continue;
+      if (m.status !== 'ok' || !m.data) continue;
+      if (m.noEdge) continue;          // NO EDGE = nothing recorded (guide rule #4)
+      if (!m.isFresh) continue;        // Stale prediction = never record (bug #9 fix)
+      if (m.data.direction === 'NONE') continue;
+      if (recordedRef.current[tf] === ws) continue; // Anti-duplicate (rule #5)
+      if (!priceState.price) continue;
 
       recordedRef.current[tf] = ws;
       tracker.recordPrediction({
@@ -113,22 +163,20 @@ export default function App() {
         probDown: m.data.prob_down,
         sampleSize: m.data.sample_size,
         confidence: m.data.confidence,
-        priceAtOpen: price,
+        priceAtOpen: priceState.price,
       });
-    };
-
-    for (const tf of TIMEFRAMES) {
-      recordForTF(tf);
     }
   }, [now, markov5M.status, markov15M.status, markov1H.status]);
 
-  // Data validity: hasData must check candle_count > 0, not just object existence (bug fix)
+  // -------------------------------------------------------------------------
+  // hasData: must check candle_count > 0, NOT just object existence (bug fix)
+  // Showing 50/50 when no data is dangerous — user could bet on it
+  // -------------------------------------------------------------------------
   const hasData =
     activeMarkov.data !== null &&
     activeMarkov.data.candle_count > 0 &&
     activeMarkov.status !== 'error';
 
-  // NO EDGE banner
   const showNoEdge = hasData && activeMarkov.noEdge;
 
   return (
@@ -136,7 +184,7 @@ export default function App() {
       <StatusBar style="light" />
       <ScrollView style={styles.scroll} contentContainerStyle={styles.content}>
 
-        {/* 1. Top bar: live price + source indicator */}
+        {/* 1. Top bar: live price + data source indicator */}
         <PriceBar
           price={priceState.price}
           source={priceState.source}
@@ -149,7 +197,7 @@ export default function App() {
           currentPrice={priceState.price}
         />
 
-        {/* 3. Timeframe tabs */}
+        {/* 3. Timeframe tabs — 15M is default (best documented edge) */}
         <View style={styles.tabs}>
           {TIMEFRAMES.map((tf) => (
             <TouchableOpacity
@@ -164,10 +212,10 @@ export default function App() {
           ))}
         </View>
 
-        {/* 4. Cycle timer */}
+        {/* 4. Cycle timer with phase + countdown + progress bar */}
         <CycleTimer phase={phase} remaining={remaining} progress={progress} />
 
-        {/* 5. UP/DOWN nodes */}
+        {/* 5. UP/DOWN nodes — only one is "lit", UPDATING during recalculation */}
         <UpDownNodes
           probUp={activeMarkov.data?.prob_up ?? 0.5}
           probDown={activeMarkov.data?.prob_down ?? 0.5}
@@ -180,11 +228,13 @@ export default function App() {
         {/* 6. NO EDGE banner */}
         {showNoEdge && (
           <View style={styles.noEdgeBanner}>
-            <Text style={styles.noEdgeText}>NO EDGE — SKIP · {Math.round((activeMarkov.data?.prob_up ?? 0.5) * 100)}% UP</Text>
+            <Text style={styles.noEdgeText}>
+              NO EDGE — SKIP · {Math.round((activeMarkov.data?.prob_up ?? 0.5) * 100)}% vs {Math.round((activeMarkov.data?.prob_down ?? 0.5) * 100)}%
+            </Text>
           </View>
         )}
 
-        {/* 7. Disclaimer (permanent) */}
+        {/* 7. Permanent disclaimer */}
         <View style={styles.disclaimer}>
           <Text style={styles.disclaimerText}>
             Short-timeframe candles are highly random. Probabilities near 50%
@@ -195,21 +245,20 @@ export default function App() {
         {/* 8. Markov pattern panel */}
         <MarkovPanel data={activeMarkov.data} hasData={hasData} />
 
-        {/* 9. Candle strip */}
+        {/* 9. Candle strip — last 20 closed candles */}
         <CandleStrip
-          pattern={activeMarkov.data?.pattern ?? []}
+          recentCandles={activeMarkov.data?.recent_candles ?? []}
           candleCount={activeMarkov.data?.candle_count ?? 0}
         />
 
-        {/* 10. Performance */}
+        {/* 10. Performance tracker */}
         <PerformancePanel stats={tracker.stats} activeTab={activeTab} />
 
-        {/* Clear history (dev utility) */}
         <TouchableOpacity style={styles.clearBtn} onPress={tracker.clearHistory}>
-          <Text style={styles.clearText}>Clear history</Text>
+          <Text style={styles.clearText}>Reset history</Text>
         </TouchableOpacity>
 
-        <View style={{ height: 40 }} />
+        <View style={{ height: 50 }} />
       </ScrollView>
     </SafeAreaView>
   );
@@ -228,12 +277,7 @@ const styles = StyleSheet.create({
     borderRadius: 8,
     padding: 3,
   },
-  tab: {
-    flex: 1,
-    paddingVertical: 8,
-    alignItems: 'center',
-    borderRadius: 6,
-  },
+  tab: { flex: 1, paddingVertical: 8, alignItems: 'center', borderRadius: 6 },
   tabActive: { backgroundColor: '#1a1a4a' },
   tabText: { fontSize: 13, fontWeight: '600', color: '#555' },
   tabTextActive: { color: '#7986CB' },
@@ -256,8 +300,13 @@ const styles = StyleSheet.create({
     borderRadius: 6,
     padding: 8,
   },
-  disclaimerText: { fontSize: 11, color: '#666', lineHeight: 16, textAlign: 'center' },
+  disclaimerText: {
+    fontSize: 11,
+    color: '#666',
+    lineHeight: 16,
+    textAlign: 'center',
+  },
 
-  clearBtn: { marginHorizontal: 16, marginTop: 20, alignItems: 'center', opacity: 0.4 },
+  clearBtn: { marginHorizontal: 16, marginTop: 24, alignItems: 'center', opacity: 0.35 },
   clearText: { fontSize: 11, color: '#888' },
 });

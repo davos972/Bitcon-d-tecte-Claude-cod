@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { TimeFrame, getWindowStart } from '../utils/cycle';
+import { TimeFrame, CYCLE_SECONDS, getWindowStart } from '../utils/cycle';
 
 const BACKEND = process.env.EXPO_PUBLIC_BACKEND_URL ?? 'http://localhost:8000';
 const RETRY_DELAY_MS = 2500;
@@ -11,6 +11,7 @@ export interface MarkovData {
   prob_down: number;
   direction: 'UP' | 'DOWN' | 'NONE';
   pattern: string[];
+  recent_candles: string[];
   up_count: number;
   down_count: number;
   sample_size: number;
@@ -62,13 +63,11 @@ export function useMarkov(tf: TimeFrame): MarkovState {
     d.prob_up >= 0.45 && d.prob_up <= 0.55;
 
   const isFreshCheck = (d: MarkovData, windowStart: number): boolean => {
-    // The pattern's last candle should be the candle just before windowStart.
-    // Cycle duration = windowStart - previousWindowStart, so:
-    // expected last_closed_time = windowStart - cycleSeconds
-    // But we don't have cycleSeconds here easily. Instead: last_closed_time < windowStart is enough
-    // AND last_closed_time should equal windowStart - some_multiple_of_cycle.
-    // Simplest reliable check: last_closed_time must be < windowStart
-    return d.last_closed_time > 0 && d.last_closed_time < windowStart;
+    // The PDF specifies the exact check:
+    // last_closed_time must equal windowStart - cycleDuration
+    // This ensures the pattern uses the candle immediately before the current window.
+    const expectedLastClosed = windowStart - CYCLE_SECONDS[tf];
+    return d.last_closed_time === expectedLastClosed;
   };
 
   const fetchData = useCallback(

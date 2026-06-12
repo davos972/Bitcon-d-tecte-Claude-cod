@@ -48,6 +48,7 @@ export interface TrackerState {
     confidence: string;
     priceAtOpen: number;
   }) => void;
+  updateClosePrice: (tf: TimeFrame, windowStart: number, priceAtClose: number) => void;
   clearHistory: () => void;
 }
 
@@ -272,5 +273,5 @@ export function useTracker(): TrackerState {
 
   const stats = computeStats(entries);
 
-  return { entries, stats, recordPrediction, clearHistory };
+  return { entries, stats, recordPrediction, updateClosePrice, clearHistory };
 }

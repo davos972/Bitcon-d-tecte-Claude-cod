@@ -240,8 +240,12 @@ async def api_markov(
     if result is None:
         raise HTTPException(status_code=503, detail="Insufficient closed candle data")
 
+    # Last 20 closed candle directions for the candle strip display
+    recent_dirs = [_classify(c) for c in closed[-20:]]
+
     result["candle_source"] = candle_source
     result["current_window_open"] = current_window_open
+    result["recent_candles"] = recent_dirs
     return result
 
 
