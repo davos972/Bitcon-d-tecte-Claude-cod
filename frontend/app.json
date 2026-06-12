@@ -1,0 +1,28 @@
+{
+  "expo": {
+    "name": "BTC Markov Predictor",
+    "slug": "btc-markov-predictor",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "dark",
+    "backgroundColor": "#0A0A0A",
+    "ios": {
+      "supportsTablet": false,
+      "bundleIdentifier": "com.davos972.btcmarkov"
+    },
+    "android": {
+      "adaptiveIcon": {
+        "backgroundColor": "#0A0A0A"
+      },
+      "package": "com.davos972.btcmarkov"
+    },
+    "web": {
+      "bundler": "metro"
+    },
+    "extra": {
+      "eas": {
+        "projectId": "your-project-id-here"
+      }
+    }
+  }
+}
