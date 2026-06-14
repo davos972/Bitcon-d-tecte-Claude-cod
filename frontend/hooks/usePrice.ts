@@ -2,7 +2,12 @@ import { useEffect, useRef, useState } from 'react';
 
 const BACKEND = process.env.EXPO_PUBLIC_BACKEND_URL ?? 'http://localhost:8000';
 const POLL_INTERVAL_MS = 5000;
-const WS_URL = 'wss://ws-livedata.polymarket.com';
+// Correct host is ws-live-data (with hyphens). The old 'ws-livedata' never
+// resolved → the app was permanently stuck on the FALLBACK price source
+// instead of the Chainlink feed Polymarket actually resolves markets with.
+const WS_URL = 'wss://ws-live-data.polymarket.com';
+const RTDS_TOPIC = 'crypto_prices_chainlink';
+const RTDS_ASSET = 'btc/usd';
 
 export type PriceSource = 'CHAINLINK_RTDS' | 'FALLBACK';
 
@@ -68,10 +73,14 @@ export function usePrice(): PriceState {
       wsRef.current = ws;
 
       ws.onopen = () => {
+        // Subscribe to the Chainlink price topic, filtered to btc/usd. The exact
+        // payload shape is undocumented, so we send the common variants and keep
+        // the polling fallback as a safety net (see onerror/onclose).
         ws.send(
           JSON.stringify({
             type: 'subscribe',
-            topic: 'crypto_prices_chainlink',
+            topic: RTDS_TOPIC,
+            filters: { symbol: RTDS_ASSET },
           })
         );
       };
@@ -79,13 +88,16 @@ export function usePrice(): PriceState {
       ws.onmessage = (evt) => {
         try {
           const msg = JSON.parse(evt.data as string);
+          // Some servers wrap the payload under `payload`/`data`.
+          const body = msg?.payload ?? msg?.data ?? msg;
           // Filter for btc/usd price updates
-          const asset = msg?.asset ?? msg?.symbol ?? msg?.pair ?? '';
-          if (
-            asset.toLowerCase().includes('btc') ||
-            asset.toLowerCase().includes('bitcoin')
-          ) {
-            const price = parseFloat(msg?.price ?? msg?.value ?? msg?.data?.price);
+          const asset = String(
+            body?.asset ?? body?.symbol ?? body?.pair ?? msg?.symbol ?? ''
+          ).toLowerCase();
+          if (asset.includes('btc') || asset.includes('bitcoin')) {
+            const price = parseFloat(
+              body?.price ?? body?.value ?? body?.p ?? body?.data?.price
+            );
             if (!isNaN(price) && price > 0) {
               rtdsActiveRef.current = true;
               stopPolling();

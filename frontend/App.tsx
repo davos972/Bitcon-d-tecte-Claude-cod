@@ -154,6 +154,14 @@ export default function App() {
       if (recordedRef.current[tf] === ws) continue; // Anti-duplicate (rule #5)
       if (!priceState.price) continue;
 
+      // Prefer the exact candle open of this window (used for local scoring of
+      // the 1H tab) over the live price, which is captured a few seconds into
+      // the window. Only trust it when the Markov data is for this same window.
+      const exactOpen =
+        m.windowStart === ws && m.data.current_window_open != null
+          ? m.data.current_window_open
+          : priceState.price;
+
       recordedRef.current[tf] = ws;
       tracker.recordPrediction({
         tf,
@@ -163,7 +171,7 @@ export default function App() {
         probDown: m.data.prob_down,
         sampleSize: m.data.sample_size,
         confidence: m.data.confidence,
-        priceAtOpen: priceState.price,
+        priceAtOpen: exactOpen,
       });
     }
   }, [now, markov5M.status, markov15M.status, markov1H.status]);
