@@ -11,9 +11,9 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 
 # Load backend/.env so CRYPTOCOMPARE_API_KEY (and friends) are available via
-# os.getenv below. Without this, the key in .env is silently ignored and the
-# app falls back to Coinbase even when a key is configured.
-load_dotenv()
+# os.getenv below. Resolve the path next to this file so the key loads no matter
+# what the current working directory is (e.g. when started from a launcher).
+load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
 
 # Logging MUST be configured at the very top, before any function definition.
 # Bug lesson #4: if logger is used inside an except block but defined later,
