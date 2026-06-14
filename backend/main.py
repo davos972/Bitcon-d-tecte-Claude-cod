@@ -6,8 +6,14 @@ import time
 from typing import Optional
 
 import httpx
+from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
+
+# Load backend/.env so CRYPTOCOMPARE_API_KEY (and friends) are available via
+# os.getenv below. Without this, the key in .env is silently ignored and the
+# app falls back to Coinbase even when a key is configured.
+load_dotenv()
 
 # Logging MUST be configured at the very top, before any function definition.
 # Bug lesson #4: if logger is used inside an except block but defined later,
@@ -244,11 +250,24 @@ async def _get_candles(mode: str) -> tuple[Optional[list], str]:
         if cached and time.time() - cached[0] < _CANDLE_CACHE_TTL:
             return cached[2], cached[1]
 
-        candles = await _fetch_candles_cc(mode)
-        source = "cryptocompare"
-        if not candles:
-            candles = await _fetch_candles_coinbase(mode)
-            source = "coinbase"
+        # Pick the source with the most history — more candles => more reliable
+        # Markov frequencies (guide target ~2000). CryptoCompare's `limit` caps
+        # at 2000 *base minutes*, so an aggregated 15M call yields only ~133
+        # candles; Coinbase paginates to ~2000. CryptoCompare wins only for 1H
+        # (histohour returns 2000 hourly candles in one call). So: take CC's one
+        # cheap call, and only pay for Coinbase pagination when CC came back thin.
+        cc = await _fetch_candles_cc(mode)
+        if cc and len(cc) >= TARGET_CANDLES * 0.8:
+            candles, source = cc, "cryptocompare"
+        else:
+            cb = await _fetch_candles_coinbase(mode)
+            if cb and (not cc or len(cb) > len(cc)):
+                candles, source = cb, "coinbase"
+            elif cc:
+                candles, source = cc, "cryptocompare"
+            else:
+                candles, source = None, "none"
+
         if not candles:
             # Serve stale cache rather than a hard failure, if we have any.
             if cached:
