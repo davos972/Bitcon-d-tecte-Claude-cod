@@ -36,7 +36,15 @@ export function usePrice(): PriceState {
 
   const wsRef = useRef<WebSocket | null>(null);
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const pingRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const rtdsActiveRef = useRef(false);
+
+  const stopPing = () => {
+    if (pingRef.current) {
+      clearInterval(pingRef.current);
+      pingRef.current = null;
+    }
+  };
 
   const startPolling = () => {
     if (pollRef.current) return;
@@ -73,31 +81,44 @@ export function usePrice(): PriceState {
       wsRef.current = ws;
 
       ws.onopen = () => {
-        // Subscribe to the Chainlink price topic, filtered to btc/usd. The exact
-        // payload shape is undocumented, so we send the common variants and keep
-        // the polling fallback as a safety net (see onerror/onclose).
+        // Official RTDS subscribe format (verified live against the server):
+        // action + subscriptions[] with the symbol filter as a JSON *string*.
         ws.send(
           JSON.stringify({
-            type: 'subscribe',
-            topic: RTDS_TOPIC,
-            filters: { symbol: RTDS_ASSET },
+            action: 'subscribe',
+            subscriptions: [
+              { topic: RTDS_TOPIC, type: '*', filters: `{"symbol":"${RTDS_ASSET}"}` },
+            ],
           })
         );
+        // The server drops idle connections — keepalive with a raw PING every 5s.
+        stopPing();
+        pingRef.current = setInterval(() => {
+          try {
+            ws.send('PING');
+          } catch {
+            // socket closing — onclose will handle reconnect
+          }
+        }, 5000);
       };
 
       ws.onmessage = (evt) => {
         try {
           const msg = JSON.parse(evt.data as string);
-          // Some servers wrap the payload under `payload`/`data`.
-          const body = msg?.payload ?? msg?.data ?? msg;
-          // Filter for btc/usd price updates
-          const asset = String(
-            body?.asset ?? body?.symbol ?? body?.pair ?? msg?.symbol ?? ''
-          ).toLowerCase();
-          if (asset.includes('btc') || asset.includes('bitcoin')) {
-            const price = parseFloat(
-              body?.price ?? body?.value ?? body?.p ?? body?.data?.price
-            );
+          // Live update shape:   { topic, type:"update", payload:{ symbol, value } }
+          // Initial snapshot:     { payload:{ data:[ { timestamp, value }, ... ] } }
+          const payload = msg?.payload ?? msg;
+          const symbol = String(payload?.symbol ?? '').toLowerCase();
+          // For the snapshot array (no symbol field), take the latest value — we
+          // only ever subscribe to btc/usd, so it is unambiguous.
+          const snapshot = Array.isArray(payload?.data) ? payload.data : null;
+          const rawValue = snapshot
+            ? snapshot[snapshot.length - 1]?.value
+            : payload?.value;
+
+          const isBtc = snapshot != null || symbol.includes('btc');
+          if (isBtc) {
+            const price = parseFloat(rawValue);
             if (!isNaN(price) && price > 0) {
               rtdsActiveRef.current = true;
               stopPolling();
@@ -122,6 +143,7 @@ export function usePrice(): PriceState {
       ws.onclose = () => {
         rtdsActiveRef.current = false;
         wsRef.current = null;
+        stopPing();
         startPolling();
         // Attempt reconnect after 10 seconds
         setTimeout(connectRTDS, 10_000);
@@ -140,6 +162,7 @@ export function usePrice(): PriceState {
 
     return () => {
       stopPolling();
+      stopPing();
       if (wsRef.current) {
         wsRef.current.onclose = null;
         wsRef.current.close();
