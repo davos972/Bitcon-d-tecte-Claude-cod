@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 
 const BACKEND = process.env.EXPO_PUBLIC_BACKEND_URL ?? 'http://localhost:8000';
 const POLL_INTERVAL_MS = 5000;
@@ -18,6 +18,22 @@ export interface PriceState {
   lastUpdated: number | null;
 }
 
+export interface PriceApi extends PriceState {
+  /**
+   * Exact Chainlink value at a given UTC second, from the timestamped RTDS
+   * buffer (initial snapshot backlog + live updates). This is the value
+   * Polymarket resolves "Price to Beat" on. Returns null if that second is not
+   * (yet) buffered — caller should fall back to the candle open.
+   */
+  getPriceAt: (tsSeconds: number) => number | null;
+}
+
+// Keep ~25 min of per-second Chainlink ticks (enough for a 15M window + margin).
+const BUFFER_MAX = 1500;
+// When the exact second is missing, accept the nearest earlier tick within this
+// many seconds (Chainlink "last known value" semantics; gaps are rare).
+const NEAREST_LOOKBACK = 120;
+
 /**
  * Provides live BTC/USD price.
  *
@@ -26,13 +42,40 @@ export interface PriceState {
  * Fallback: polling /api/price every 5 seconds (CryptoCompare → Coinbase).
  * A "FALLBACK" banner must be shown to the user when RTDS is unavailable.
  */
-export function usePrice(): PriceState {
+export function usePrice(): PriceApi {
   const [state, setState] = useState<PriceState>({
     price: null,
     source: 'FALLBACK',
     isFallback: true,
     lastUpdated: null,
   });
+
+  // Timestamped Chainlink ticks: UTC second → price. Fed from the RTDS snapshot
+  // backlog and every live update, so we can read the exact window-open value.
+  const bufferRef = useRef<Map<number, number>>(new Map());
+
+  const addTick = (tsMs: number, value: number) => {
+    if (!Number.isFinite(tsMs) || !Number.isFinite(value) || value <= 0) return;
+    const sec = Math.floor(tsMs / 1000);
+    const buf = bufferRef.current;
+    buf.set(sec, value);
+    if (buf.size > BUFFER_MAX) {
+      // Drop the oldest second (Map preserves insertion order).
+      const oldest = buf.keys().next().value;
+      if (oldest !== undefined) buf.delete(oldest);
+    }
+  };
+
+  const getPriceAt = useCallback((tsSeconds: number): number | null => {
+    const buf = bufferRef.current;
+    const exact = buf.get(tsSeconds);
+    if (exact !== undefined) return exact;
+    for (let t = tsSeconds - 1; t >= tsSeconds - NEAREST_LOOKBACK; t--) {
+      const v = buf.get(t);
+      if (v !== undefined) return v;
+    }
+    return null;
+  }, []);
 
   const wsRef = useRef<WebSocket | null>(null);
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
@@ -116,6 +159,16 @@ export function usePrice(): PriceState {
             ? snapshot[snapshot.length - 1]?.value
             : payload?.value;
 
+          // Buffer timestamped ticks so getPriceAt() can return the exact
+          // window-open value (matches Polymarket's Chainlink resolution).
+          if (snapshot) {
+            for (const t of snapshot) {
+              addTick(Number(t?.timestamp), parseFloat(t?.value));
+            }
+          } else if (payload?.timestamp != null) {
+            addTick(Number(payload.timestamp), parseFloat(payload.value));
+          }
+
           const isBtc = snapshot != null || symbol.includes('btc');
           if (isBtc) {
             const price = parseFloat(rawValue);
@@ -171,5 +224,5 @@ export function usePrice(): PriceState {
     };
   }, []);
 
-  return state;
+  return { ...state, getPriceAt };
 }

@@ -66,33 +66,50 @@ export default function App() {
   const priceToBeatRef = useRef<number | null>(null);
   const windowOpenTsRef = useRef<number>(0);
   const priceInitializedRef = useRef(false);
-  // windowStart for which we captured a Chainlink RTDS snapshot AT the boundary.
-  // Polymarket resolves on the Chainlink BTC/USD stream, so when we have that
-  // boundary snapshot it IS the price to beat — we must NOT overwrite it with
-  // the Coinbase candle open (Rule 3b), which is a different source (~2-3$ off).
-  const chainlinkAtBoundaryRef = useRef<number>(0);
+  // windowStart for which we hold the EXACT Chainlink open tick (timestamp ==
+  // windowStart). That value is what Polymarket resolves on, so once we have it
+  // neither the live price nor the Coinbase candle open (Rule 3b) may override.
+  const exactOpenWindowRef = useRef<number>(0);
 
-  // Trigger: window boundary changed → capture new open price (Rule 2)
+  // Trigger: window boundary changed → capture new open price (Rule 2).
+  // Prefer the exact Chainlink tick at windowStart; otherwise show the live
+  // price as a placeholder until the exact tick arrives (upgrade effect below)
+  // or the candle open refines it (Rule 3b).
   useEffect(() => {
     if (windowStart !== windowOpenTsRef.current) {
       windowOpenTsRef.current = windowStart;
-      if (priceState.price !== null) {
+      const exactOpen =
+        priceState.source === 'CHAINLINK_RTDS'
+          ? priceState.getPriceAt(windowStart)
+          : null;
+      if (exactOpen != null) {
+        priceToBeatRef.current = exactOpen;
+        setPriceToBeat(exactOpen);
+        exactOpenWindowRef.current = windowStart;
+        priceInitializedRef.current = true;
+      } else if (priceState.price !== null) {
         priceToBeatRef.current = priceState.price;
         setPriceToBeat(priceState.price);
         priceInitializedRef.current = true;
-        // The Chainlink live snapshot only equals the window OPEN when we are
-        // at the real-time boundary (the window just opened). On a timeframe
-        // switch, windowStart also changes but points to a window opened
-        // minutes ago — the live price is NOT its open, so we must let Rule 3b
-        // refine to the candle open. Distinguish by how fresh the window is.
-        const atRealBoundary = now - windowStart <= 2;
-        chainlinkAtBoundaryRef.current =
-          atRealBoundary && priceState.source === 'CHAINLINK_RTDS'
-            ? windowStart
-            : 0;
       }
     }
   }, [windowStart]);
+
+  // Upgrade to the EXACT Chainlink open tick once it lands in the buffer. At a
+  // real-time boundary the windowStart tick arrives ~1s after the boundary, so
+  // the placeholder above is replaced the moment it is buffered. Also nails the
+  // open instantly on a timeframe switch when the tick is still in the backlog.
+  useEffect(() => {
+    if (priceState.source !== 'CHAINLINK_RTDS') return;
+    if (exactOpenWindowRef.current === windowOpenTsRef.current) return;
+    const exactOpen = priceState.getPriceAt(windowOpenTsRef.current);
+    if (exactOpen != null) {
+      priceToBeatRef.current = exactOpen;
+      setPriceToBeat(exactOpen);
+      exactOpenWindowRef.current = windowOpenTsRef.current;
+      priceInitializedRef.current = true;
+    }
+  }, [priceState.price, windowStart]);
 
   // Trigger: price arrives for the first time before first window boundary
   useEffect(() => {
@@ -116,15 +133,15 @@ export default function App() {
   }, []);
 
   // Rule 3b: refine to exact candle open once historical data has it.
-  // Skipped when we already hold a Chainlink RTDS boundary snapshot for this
-  // window — that snapshot matches Polymarket's resolution source; the Coinbase
-  // candle open does not. Still applies on FALLBACK or mid-window app opens.
+  // Skipped when we already hold the exact Chainlink open tick for this window
+  // (that matches Polymarket's resolution source; the Coinbase candle open does
+  // not). Still applies on FALLBACK or when the open tick is out of the buffer.
   useEffect(() => {
     const d = activeMarkov.data;
     if (
       d?.current_window_open != null &&
       activeMarkov.windowStart === windowOpenTsRef.current &&
-      chainlinkAtBoundaryRef.current !== windowOpenTsRef.current
+      exactOpenWindowRef.current !== windowOpenTsRef.current
     ) {
       const exact = d.current_window_open;
       if (exact !== priceToBeatRef.current) {
