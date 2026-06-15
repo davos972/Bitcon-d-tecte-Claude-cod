@@ -80,10 +80,16 @@ export default function App() {
         priceToBeatRef.current = priceState.price;
         setPriceToBeat(priceState.price);
         priceInitializedRef.current = true;
-        // Mark this window as Chainlink-sourced only if RTDS was live at the
-        // boundary; on FALLBACK we keep refining to the candle open instead.
+        // The Chainlink live snapshot only equals the window OPEN when we are
+        // at the real-time boundary (the window just opened). On a timeframe
+        // switch, windowStart also changes but points to a window opened
+        // minutes ago — the live price is NOT its open, so we must let Rule 3b
+        // refine to the candle open. Distinguish by how fresh the window is.
+        const atRealBoundary = now - windowStart <= 2;
         chainlinkAtBoundaryRef.current =
-          priceState.source === 'CHAINLINK_RTDS' ? windowStart : 0;
+          atRealBoundary && priceState.source === 'CHAINLINK_RTDS'
+            ? windowStart
+            : 0;
       }
     }
   }, [windowStart]);
