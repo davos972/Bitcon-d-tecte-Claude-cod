@@ -66,6 +66,11 @@ export default function App() {
   const priceToBeatRef = useRef<number | null>(null);
   const windowOpenTsRef = useRef<number>(0);
   const priceInitializedRef = useRef(false);
+  // windowStart for which we captured a Chainlink RTDS snapshot AT the boundary.
+  // Polymarket resolves on the Chainlink BTC/USD stream, so when we have that
+  // boundary snapshot it IS the price to beat — we must NOT overwrite it with
+  // the Coinbase candle open (Rule 3b), which is a different source (~2-3$ off).
+  const chainlinkAtBoundaryRef = useRef<number>(0);
 
   // Trigger: window boundary changed → capture new open price (Rule 2)
   useEffect(() => {
@@ -75,6 +80,10 @@ export default function App() {
         priceToBeatRef.current = priceState.price;
         setPriceToBeat(priceState.price);
         priceInitializedRef.current = true;
+        // Mark this window as Chainlink-sourced only if RTDS was live at the
+        // boundary; on FALLBACK we keep refining to the candle open instead.
+        chainlinkAtBoundaryRef.current =
+          priceState.source === 'CHAINLINK_RTDS' ? windowStart : 0;
       }
     }
   }, [windowStart]);
@@ -100,12 +109,16 @@ export default function App() {
     }
   }, []);
 
-  // Rule 3b: refine to exact candle open once historical data has it
+  // Rule 3b: refine to exact candle open once historical data has it.
+  // Skipped when we already hold a Chainlink RTDS boundary snapshot for this
+  // window — that snapshot matches Polymarket's resolution source; the Coinbase
+  // candle open does not. Still applies on FALLBACK or mid-window app opens.
   useEffect(() => {
     const d = activeMarkov.data;
     if (
       d?.current_window_open != null &&
-      activeMarkov.windowStart === windowOpenTsRef.current
+      activeMarkov.windowStart === windowOpenTsRef.current &&
+      chainlinkAtBoundaryRef.current !== windowOpenTsRef.current
     ) {
       const exact = d.current_window_open;
       if (exact !== priceToBeatRef.current) {
