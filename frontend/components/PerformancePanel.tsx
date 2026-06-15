@@ -93,7 +93,7 @@ function TFRow({
           <View style={[styles.barFill, { width: barWidth, backgroundColor: barColor }]} />
         </View>
         <Text style={[styles.pct, { color: s.total >= 30 ? barColor : '#666' }]}>
-          {s.total >= 10 ? `${pct}%` : '—'}
+          {s.total > 0 ? `${pct}%` : '—'}
         </Text>
       </View>
     </View>
