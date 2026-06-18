@@ -16,32 +16,43 @@ from fastapi.testclient import TestClient  # noqa: E402
 # ---------------------------------------------------------------------------
 
 def test_merge_adds_new_ids():
-    existing = [{"id": "15M-100", "result": "PENDING", "recordedAt": 1}]
-    incoming = [{"id": "15M-200", "result": "PENDING", "recordedAt": 2}]
+    existing = [{"id": "15M-100", "result": "PENDING", "recordedAt": 1, "windowStart": 1_781_000_000}]
+    incoming = [{"id": "15M-200", "result": "PENDING", "recordedAt": 2, "windowStart": 1_781_000_900}]
     merged = main._merge_entries(existing, incoming)
     assert [e["id"] for e in merged] == ["15M-100", "15M-200"]
 
 
 def test_merge_scored_overrides_pending():
-    existing = [{"id": "15M-100", "result": "PENDING", "recordedAt": 1}]
-    incoming = [{"id": "15M-100", "result": "WIN", "recordedAt": 1}]
+    existing = [{"id": "15M-100", "result": "PENDING", "recordedAt": 1, "windowStart": 1_781_000_000}]
+    incoming = [{"id": "15M-100", "result": "WIN", "recordedAt": 1, "windowStart": 1_781_000_000}]
     merged = main._merge_entries(existing, incoming)
     assert len(merged) == 1
     assert merged[0]["result"] == "WIN"
 
 
 def test_merge_pending_never_downgrades_scored():
-    existing = [{"id": "15M-100", "result": "LOSS", "recordedAt": 1}]
-    incoming = [{"id": "15M-100", "result": "PENDING", "recordedAt": 1}]
+    existing = [{"id": "15M-100", "result": "LOSS", "recordedAt": 1, "windowStart": 1_781_000_000}]
+    incoming = [{"id": "15M-100", "result": "PENDING", "recordedAt": 1, "windowStart": 1_781_000_000}]
     merged = main._merge_entries(existing, incoming)
     assert merged[0]["result"] == "LOSS"
 
 
 def test_merge_both_pending_takes_incoming_fields():
-    existing = [{"id": "15M-100", "result": "PENDING", "recordedAt": 1}]
-    incoming = [{"id": "15M-100", "result": "PENDING", "recordedAt": 1, "priceAtClose": 42.0}]
+    existing = [{"id": "15M-100", "result": "PENDING", "recordedAt": 1, "windowStart": 1_781_000_000}]
+    incoming = [{"id": "15M-100", "result": "PENDING", "recordedAt": 1, "windowStart": 1_781_000_000, "priceAtClose": 42.0}]
     merged = main._merge_entries(existing, incoming)
     assert merged[0]["priceAtClose"] == 42.0
+
+
+def test_merge_drops_implausible_window_start():
+    # windowStart before 2020 (or tiny test values) must be rejected outright.
+    existing = [{"id": "15M-good", "result": "WIN", "windowStart": 1_781_000_000}]
+    incoming = [
+        {"id": "15M-1000", "result": "WIN", "windowStart": 1000},
+        {"id": "15M-nows", "result": "WIN"},  # no windowStart
+    ]
+    merged = main._merge_entries(existing, incoming)
+    assert [e["id"] for e in merged] == ["15M-good"]
 
 
 # ---------------------------------------------------------------------------
@@ -54,12 +65,12 @@ def test_tracker_endpoints_roundtrip(tmp_path, monkeypatch):
 
     assert client.get("/api/tracker").json() == {"entries": []}
 
-    e1 = {"id": "15M-100", "result": "PENDING", "recordedAt": 1}
+    e1 = {"id": "15M-100", "result": "PENDING", "recordedAt": 1, "windowStart": 1_781_000_000}
     r = client.post("/api/tracker", json={"entries": [e1]})
     assert [e["id"] for e in r.json()["entries"]] == ["15M-100"]
 
     # A second device scores it → result upgrades, no duplicate.
-    e1_won = {"id": "15M-100", "result": "WIN", "recordedAt": 1}
+    e1_won = {"id": "15M-100", "result": "WIN", "recordedAt": 1, "windowStart": 1_781_000_000}
     r = client.post("/api/tracker", json={"entries": [e1_won]})
     entries = r.json()["entries"]
     assert len(entries) == 1 and entries[0]["result"] == "WIN"
