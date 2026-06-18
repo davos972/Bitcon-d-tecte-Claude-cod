@@ -13,6 +13,10 @@ dist/
 .env
 .env.local
 
+# Tracker persistence (local prediction history store)
+tracker_store.json
+tracker_store.json.tmp
+
 # Node / Expo
 node_modules/
 .expo/
