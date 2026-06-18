@@ -55,12 +55,26 @@ _tracker_lock = asyncio.Lock()
 # A scored result must never be downgraded back to PENDING when merging.
 _RESULT_RANK = {"PENDING": 0, "EXPIRED": 1, "WIN": 2, "LOSS": 2}
 
+# Reject entries with an implausible windowStart (must be a Unix-seconds
+# timestamp after 2020-09-13). Guards the honest tracker against garbage/test
+# data — a single bad entry would corrupt the win-rate permanently.
+_MIN_WINDOW_START = 1_600_000_000
+
+
+def _is_plausible(e) -> bool:
+    if not isinstance(e, dict) or not e.get("id"):
+        return False
+    ws = e.get("windowStart")
+    return isinstance(ws, (int, float)) and not isinstance(ws, bool) and ws >= _MIN_WINDOW_START
+
 
 def _load_tracker() -> list:
     try:
         with open(TRACKER_STORE_PATH, "r", encoding="utf-8") as f:
             data = json.load(f)
-        return data if isinstance(data, list) else []
+        if not isinstance(data, list):
+            return []
+        return [e for e in data if _is_plausible(e)]
     except FileNotFoundError:
         return []
     except Exception as exc:
@@ -83,10 +97,10 @@ def _merge_entries(existing: list, incoming: list) -> list:
     are scored keep the existing one (already immutable). Never drops an id."""
     by_id: dict = {}
     for e in existing:
-        if isinstance(e, dict) and e.get("id"):
+        if _is_plausible(e):
             by_id[e["id"]] = e
     for e in incoming:
-        if not isinstance(e, dict) or not e.get("id"):
+        if not _is_plausible(e):
             continue
         cur = by_id.get(e["id"])
         if cur is None:
