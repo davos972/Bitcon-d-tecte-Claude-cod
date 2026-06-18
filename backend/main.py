@@ -9,6 +9,7 @@ import httpx
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 
 # Load backend/.env so CRYPTOCOMPARE_API_KEY (and friends) are available via
 # os.getenv below. Resolve the path next to this file so the key loads no matter
@@ -39,6 +40,69 @@ app.add_middleware(
 CRYPTOCOMPARE_API_KEY = os.getenv("CRYPTOCOMPARE_API_KEY", "")
 CC_BASE = "https://min-api.cryptocompare.com/data"
 GAMMA_API_BASE = "https://gamma-api.polymarket.com"
+
+# --- Tracker persistence -------------------------------------------------
+# The frontend tracker is otherwise per-device (AsyncStorage), so opening the
+# app on another device starts from zero. We keep a single shared store on disk
+# here so every device reads/writes the same prediction history. JSON file with
+# atomic write, serialized by an async lock. Unlimited history + anti-duplicate
+# by entry id, per the honesty rules.
+TRACKER_STORE_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "tracker_store.json"
+)
+_tracker_lock = asyncio.Lock()
+
+# A scored result must never be downgraded back to PENDING when merging.
+_RESULT_RANK = {"PENDING": 0, "EXPIRED": 1, "WIN": 2, "LOSS": 2}
+
+
+def _load_tracker() -> list:
+    try:
+        with open(TRACKER_STORE_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, list) else []
+    except FileNotFoundError:
+        return []
+    except Exception as exc:
+        logger.error("Tracker store read failed: %s", exc)
+        return []
+
+
+def _save_tracker(entries: list) -> None:
+    tmp = f"{TRACKER_STORE_PATH}.tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(entries, f)
+        os.replace(tmp, TRACKER_STORE_PATH)
+    except Exception as exc:
+        logger.error("Tracker store write failed: %s", exc)
+
+
+def _merge_entries(existing: list, incoming: list) -> list:
+    """Merge by id. Prefer a scored (non-PENDING) result over PENDING; if both
+    are scored keep the existing one (already immutable). Never drops an id."""
+    by_id: dict = {}
+    for e in existing:
+        if isinstance(e, dict) and e.get("id"):
+            by_id[e["id"]] = e
+    for e in incoming:
+        if not isinstance(e, dict) or not e.get("id"):
+            continue
+        cur = by_id.get(e["id"])
+        if cur is None:
+            by_id[e["id"]] = e
+            continue
+        cur_rank = _RESULT_RANK.get(cur.get("result", "PENDING"), 0)
+        inc_rank = _RESULT_RANK.get(e.get("result", "PENDING"), 0)
+        if inc_rank > cur_rank:
+            by_id[e["id"]] = e
+        elif inc_rank == 0 and cur_rank == 0:
+            # both pending — adopt incoming fields (may carry a fresh priceAtClose)
+            by_id[e["id"]] = {**cur, **e}
+        # else keep existing (already scored / immutable)
+    merged = list(by_id.values())
+    merged.sort(key=lambda x: (x.get("recordedAt", 0), str(x.get("id", ""))))
+    return merged
 
 # Binance is geo-blocked (451) from many servers → never use it as a server source.
 # Coinbase Exchange passes everywhere.
@@ -450,6 +514,34 @@ async def api_poly_resolution(slug: str = Query(...)):
         "slug": slug,
         "market_id": market.get("id") if isinstance(market, dict) else None,
     }
+
+
+class TrackerSync(BaseModel):
+    entries: list = []
+
+
+@app.get("/api/tracker")
+async def api_tracker_get():
+    """Return the shared prediction history (all devices read the same store)."""
+    async with _tracker_lock:
+        return {"entries": _load_tracker()}
+
+
+@app.post("/api/tracker")
+async def api_tracker_post(payload: TrackerSync):
+    """Merge the client's entries into the shared store and return the result."""
+    async with _tracker_lock:
+        merged = _merge_entries(_load_tracker(), payload.entries)
+        _save_tracker(merged)
+        return {"entries": merged}
+
+
+@app.delete("/api/tracker")
+async def api_tracker_delete():
+    """Clear the shared history (used by the 'Reset history' button)."""
+    async with _tracker_lock:
+        _save_tracker([])
+        return {"entries": []}
 
 
 @app.get("/health")

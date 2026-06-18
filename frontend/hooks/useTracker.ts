@@ -90,6 +90,65 @@ async function saveEntries(entries: TrackerEntry[]): Promise<void> {
   }
 }
 
+// A scored result must never be downgraded back to PENDING when merging.
+const RESULT_RANK: Record<string, number> = { PENDING: 0, EXPIRED: 1, WIN: 2, LOSS: 2 };
+
+/** Merge two entry lists by id, preferring a scored result over PENDING. */
+function mergeEntries(a: TrackerEntry[], b: TrackerEntry[]): TrackerEntry[] {
+  const byId = new Map<string, TrackerEntry>();
+  for (const e of a) byId.set(e.id, e);
+  for (const e of b) {
+    const cur = byId.get(e.id);
+    if (!cur) {
+      byId.set(e.id, e);
+      continue;
+    }
+    const cr = RESULT_RANK[cur.result] ?? 0;
+    const ir = RESULT_RANK[e.result] ?? 0;
+    if (ir > cr) byId.set(e.id, e);
+    else if (ir === 0 && cr === 0) byId.set(e.id, { ...cur, ...e });
+  }
+  return Array.from(byId.values()).sort(
+    (x, y) => x.recordedAt - y.recordedAt || x.id.localeCompare(y.id)
+  );
+}
+
+/** Cheap content signature: detects new ids and result upgrades. */
+function signature(entries: TrackerEntry[]): string {
+  return entries
+    .map((e) => `${e.id}:${e.result}`)
+    .sort()
+    .join('|');
+}
+
+async function fetchServerEntries(): Promise<TrackerEntry[] | null> {
+  try {
+    const res = await fetch(`${BACKEND}/api/tracker`);
+    if (!res.ok) return null;
+    const data = await res.json();
+    return Array.isArray(data.entries) ? (data.entries as TrackerEntry[]) : [];
+  } catch {
+    return null;
+  }
+}
+
+async function pushServerEntries(
+  entries: TrackerEntry[]
+): Promise<TrackerEntry[] | null> {
+  try {
+    const res = await fetch(`${BACKEND}/api/tracker`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ entries }),
+    });
+    if (!res.ok) return null;
+    const data = await res.json();
+    return Array.isArray(data.entries) ? (data.entries as TrackerEntry[]) : null;
+  } catch {
+    return null;
+  }
+}
+
 async function fetchPolyResolution(
   slug: string
 ): Promise<{ resolved: boolean; winner: string | null }> {
@@ -118,19 +177,41 @@ async function fetchPolyResolution(
 export function useTracker(): TrackerState {
   const [entries, setEntries] = useState<TrackerEntry[]>([]);
   const entriesRef = useRef<TrackerEntry[]>([]);
+  const pushTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  const updateEntries = (updated: TrackerEntry[]) => {
+  // Write to local cache + state, then debounce-push to the shared server store
+  // (set push:false to apply a server-merged result without re-pushing it).
+  const applyEntries = (updated: TrackerEntry[], opts?: { push?: boolean }) => {
     entriesRef.current = updated;
     setEntries([...updated]);
     saveEntries(updated);
+    if (opts?.push === false) return;
+    if (pushTimer.current) clearTimeout(pushTimer.current);
+    pushTimer.current = setTimeout(async () => {
+      const merged = await pushServerEntries(entriesRef.current);
+      if (merged && signature(merged) !== signature(entriesRef.current)) {
+        applyEntries(mergeEntries(entriesRef.current, merged), { push: false });
+      }
+    }, 1500);
   };
 
-  // Load persisted data on mount
+  // Load local cache immediately, then merge the shared server store on top so
+  // a fresh device inherits the full history instead of starting from zero.
   useEffect(() => {
-    loadEntries().then((loaded) => {
-      entriesRef.current = loaded;
-      setEntries(loaded);
-    });
+    (async () => {
+      const local = await loadEntries();
+      entriesRef.current = local;
+      setEntries(local);
+      const server = await fetchServerEntries();
+      if (server) {
+        const merged = mergeEntries(local, server);
+        entriesRef.current = merged;
+        setEntries([...merged]);
+        saveEntries(merged);
+        // Push any local-only entries up so other devices see them too.
+        if (signature(merged) !== signature(server)) pushServerEntries(merged);
+      }
+    })();
   }, []);
 
   // Reconcile pending entries every 12 seconds
@@ -138,7 +219,13 @@ export function useTracker(): TrackerState {
     const reconcile = async () => {
       const now = Math.floor(Date.now() / 1000);
       let changed = false;
-      const updated = [...entriesRef.current];
+      // Pull other devices' updates first, then reconcile our pending entries.
+      const server = await fetchServerEntries();
+      const base = server
+        ? mergeEntries(entriesRef.current, server)
+        : entriesRef.current;
+      const before = signature(base);
+      const updated = [...base];
 
       for (let i = 0; i < updated.length; i++) {
         const entry = updated[i];
@@ -212,7 +299,7 @@ export function useTracker(): TrackerState {
         }
       }
 
-      if (changed) updateEntries(updated);
+      if (changed || signature(updated) !== before) applyEntries(updated);
     };
 
     const interval = setInterval(reconcile, RECONCILE_INTERVAL_MS);
@@ -244,7 +331,7 @@ export function useTracker(): TrackerState {
       };
 
       const updated = [...entriesRef.current, entry];
-      updateEntries(updated);
+      applyEntries(updated);
     },
     []
   );
@@ -262,13 +349,15 @@ export function useTracker(): TrackerState {
       if (idx === -1) return;
       const updated = [...entriesRef.current];
       updated[idx] = { ...updated[idx], priceAtClose };
-      updateEntries(updated);
+      applyEntries(updated);
     },
     []
   );
 
   const clearHistory = useCallback(() => {
-    updateEntries([]);
+    applyEntries([], { push: false });
+    // Clear the shared server store too, so every device resets — not just this one.
+    fetch(`${BACKEND}/api/tracker`, { method: 'DELETE' }).catch(() => {});
   }, []);
 
   const stats = computeStats(entries);
