@@ -47,9 +47,13 @@ GAMMA_API_BASE = "https://gamma-api.polymarket.com"
 # here so every device reads/writes the same prediction history. JSON file with
 # atomic write, serialized by an async lock. Unlimited history + anti-duplicate
 # by entry id, per the honesty rules.
-TRACKER_STORE_PATH = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)), "tracker_store.json"
+# Store directory is configurable so production can point it at a persistent
+# disk (set TRACKER_DATA_DIR, e.g. /data on the host). Defaults next to this
+# file for local dev.
+TRACKER_DATA_DIR = os.getenv(
+    "TRACKER_DATA_DIR", os.path.dirname(os.path.abspath(__file__))
 )
+TRACKER_STORE_PATH = os.path.join(TRACKER_DATA_DIR, "tracker_store.json")
 _tracker_lock = asyncio.Lock()
 
 # A scored result must never be downgraded back to PENDING when merging.
@@ -85,6 +89,7 @@ def _load_tracker() -> list:
 def _save_tracker(entries: list) -> None:
     tmp = f"{TRACKER_STORE_PATH}.tmp"
     try:
+        os.makedirs(os.path.dirname(TRACKER_STORE_PATH) or ".", exist_ok=True)
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(entries, f)
         os.replace(tmp, TRACKER_STORE_PATH)

@@ -1,0 +1,40 @@
+# Render Blueprint — déploiement permanent de BTC Markov.
+# Backend = Web Service (always-on) avec disque persistant pour le tracker.
+# Frontend = Static Site (build web statique d'Expo).
+# Voir DEPLOY.md pour la procédure pas à pas.
+services:
+  # ---- Backend FastAPI -----------------------------------------------------
+  - type: web
+    name: btc-markov-backend
+    runtime: python
+    rootDir: backend
+    plan: starter            # always-on (pas de mise en veille)
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    disk:
+      name: tracker-data
+      mountPath: /data       # le store du tracker vit ici, survit aux redéploiements
+      sizeGB: 1
+    envVars:
+      - key: TRACKER_DATA_DIR
+        value: /data
+      - key: CRYPTOCOMPARE_API_KEY
+        sync: false          # à renseigner dans le dashboard (valeur de backend/.env)
+
+  # ---- Frontend Expo web (statique) ---------------------------------------
+  - type: web
+    name: btc-markov-frontend
+    runtime: static
+    rootDir: frontend
+    buildCommand: npm install && npx expo export -p web
+    staticPublishPath: dist
+    envVars:
+      - key: NODE_VERSION
+        value: "20"
+      - key: EXPO_PUBLIC_BACKEND_URL
+        sync: false          # = URL du backend Render (ex. https://btc-markov-backend.onrender.com)
+    routes:
+      - type: rewrite
+        source: /*
+        destination: /index.html
