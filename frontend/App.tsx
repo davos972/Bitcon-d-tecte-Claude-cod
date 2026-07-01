@@ -241,7 +241,8 @@ export default function App() {
           currentPrice={priceState.price}
         />
 
-        {/* 3. Timeframe tabs — 15M is default (best documented edge) */}
+        {/* 3. Timeframe tabs — 15M is default and the most reliable (best
+            documented edge + best-calibrated in our own tracked results). */}
         <View style={styles.tabs}>
           {TIMEFRAMES.map((tf) => (
             <TouchableOpacity
@@ -250,11 +251,12 @@ export default function App() {
               onPress={() => setActiveTab(tf)}
             >
               <Text style={[styles.tabText, activeTab === tf && styles.tabTextActive]}>
-                {tf}
+                {tf === '15M' ? '★ ' : ''}{tf}
               </Text>
             </TouchableOpacity>
           ))}
         </View>
+        <Text style={styles.tabsCaption}>★ 15M — most reliable timeframe (best calibrated)</Text>
 
         {/* 4. Cycle timer with phase + countdown + progress bar */}
         <CycleTimer phase={phase} remaining={remaining} progress={progress} />
@@ -283,6 +285,8 @@ export default function App() {
           <Text style={styles.disclaimerText}>
             Short-timeframe candles are highly random. Probabilities near 50%
             mean no edge. Past patterns do not guarantee future results.
+            {'\n'}A higher percentage is not a stronger bet: across hundreds of
+            tracked results, higher-confidence signals were no more accurate.
           </Text>
         </View>
 
@@ -325,6 +329,7 @@ const styles = StyleSheet.create({
   tabActive: { backgroundColor: '#1a1a4a' },
   tabText: { fontSize: 13, fontWeight: '600', color: '#555' },
   tabTextActive: { color: '#7986CB' },
+  tabsCaption: { marginHorizontal: 16, marginTop: 5, fontSize: 10, color: '#666', textAlign: 'center' },
 
   noEdgeBanner: {
     marginHorizontal: 16,
