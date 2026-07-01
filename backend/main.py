@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import math
 import os
 import time
 from typing import Optional
@@ -372,12 +373,16 @@ def _classify(candle: dict) -> str:
     return "U" if float(candle["close"]) >= float(candle["open"]) else "D"
 
 
-def _compute_markov(closed: list, max_n: int = 3) -> Optional[dict]:
-    if len(closed) < max_n + 1:
-        return None
+def _markov_core(directions: list, max_n: int = 3) -> Optional[dict]:
+    """Pure pattern-frequency step over a U/D sequence, shared by /api/markov
+    and /api/backtest so the backtest exercises the EXACT same engine.
 
-    directions = [_classify(c) for c in closed]
-    last_closed_time = int(closed[-1]["time"])
+    Returns None if the sequence is too short; otherwise a dict with prob_up and
+    the matched pattern stats, or a LOW/no-direction dict when no N reaches the
+    20-occurrence threshold. Keeps no candle-specific fields (caller adds those).
+    """
+    if len(directions) < max_n + 1:
+        return None
 
     # Try N=3, fall back to N=2 then N=1 if fewer than 20 occurrences.
     for n in range(max_n, 0, -1):
@@ -396,36 +401,48 @@ def _compute_markov(closed: list, max_n: int = 3) -> Optional[dict]:
         if total < 20:
             continue
         prob_up = up_count / total
-        # Confidence: HIGH ≥50 matches, MEDIUM 20-49
-        confidence = "HIGH" if total >= 50 else "MEDIUM"
         return {
-            "prob_up": round(prob_up, 4),
-            "prob_down": round(1 - prob_up, 4),
+            "prob_up": prob_up,
             "direction": "UP" if prob_up >= 0.5 else "DOWN",
             "pattern": list(current_pattern),
             "up_count": up_count,
             "down_count": down_count,
             "sample_size": total,
             "n_used": n,
-            "confidence": confidence,
-            "candle_count": len(closed),
-            "last_closed_time": last_closed_time,
+            "confidence": "HIGH" if total >= 50 else "MEDIUM",  # by match count
         }
 
-    # Insufficient sample for any N → return LOW confidence, no direction
-    pattern = list(directions[-max_n:]) if len(directions) >= max_n else list(directions)
+    # Insufficient sample for any N → LOW confidence, no direction.
     return {
         "prob_up": 0.5,
-        "prob_down": 0.5,
         "direction": "NONE",
-        "pattern": pattern,
+        "pattern": list(directions[-max_n:]),
         "up_count": 0,
         "down_count": 0,
         "sample_size": 0,
         "n_used": max_n,
         "confidence": "LOW",
+    }
+
+
+def _compute_markov(closed: list, max_n: int = 3) -> Optional[dict]:
+    if len(closed) < max_n + 1:
+        return None
+    directions = [_classify(c) for c in closed]
+    core = _markov_core(directions, max_n)
+    prob_up = core["prob_up"]
+    return {
+        "prob_up": round(prob_up, 4),
+        "prob_down": round(1 - prob_up, 4),
+        "direction": core["direction"],
+        "pattern": core["pattern"],
+        "up_count": core["up_count"],
+        "down_count": core["down_count"],
+        "sample_size": core["sample_size"],
+        "n_used": core["n_used"],
+        "confidence": core["confidence"],
         "candle_count": len(closed),
-        "last_closed_time": last_closed_time if closed else 0,
+        "last_closed_time": int(closed[-1]["time"]),
     }
 
 
@@ -465,6 +482,95 @@ async def api_markov(
     result["current_window_open"] = current_window_open
     result["recent_candles"] = recent_dirs
     return result
+
+
+# ---------------------------------------------------------------------------
+# Walk-forward backtest — replays the SAME engine over history
+# ---------------------------------------------------------------------------
+
+def _wilson(wins: int, total: int) -> tuple:
+    """95% Wilson score interval for a win rate (returns fractions 0-1)."""
+    if total == 0:
+        return (0.0, 0.0)
+    z = 1.96
+    p = wins / total
+    den = 1 + z * z / total
+    centre = (p + z * z / (2 * total)) / den
+    half = z * math.sqrt(p * (1 - p) / total + z * z / (4 * total * total)) / den
+    return (max(0.0, centre - half), min(1.0, centre + half))
+
+
+# Confidence buckets (winning-side prob) — mirrors the live calibration analysis
+# so the backtest also shows whether higher confidence is actually more accurate.
+_CONF_BINS = [(0.55, 0.575), (0.575, 0.60), (0.60, 0.65), (0.65, 0.70), (0.70, 1.01)]
+
+# Enough prior candles before we let the engine predict (needs ~50 for HIGH).
+_BACKTEST_MIN_HISTORY = 50
+
+
+@app.get("/api/backtest")
+async def api_backtest(mode: str = Query("15M", pattern="^(5M|15M|1H)$")):
+    """Walk-forward backtest: for each candle, predict it using ONLY the candles
+    before it (same engine as /api/markov), then compare to what actually
+    happened. Applies the live NO-EDGE gate (skip 0.45–0.55). Gives a large,
+    honest, out-of-sample estimate of the strategy's edge in one shot.
+
+    Caveat: idealised upper bound — ignores live timing/freshness and scores on
+    our own candles, not Polymarket resolution.
+    """
+    candles, candle_source = await _get_candles(mode)
+    if not candles or len(candles) <= _BACKTEST_MIN_HISTORY + 1:
+        raise HTTPException(status_code=503, detail="Not enough candle data for a backtest")
+
+    dirs = [_classify(c) for c in candles]
+    n = len(dirs)
+    bets = wins = skipped_no_edge = skipped_no_direction = 0
+    bins = [{"lo": lo, "hi": hi, "bets": 0, "wins": 0} for lo, hi in _CONF_BINS]
+
+    for i in range(_BACKTEST_MIN_HISTORY, n):
+        core = _markov_core(dirs[:i])
+        if core is None or core["direction"] == "NONE":
+            skipped_no_direction += 1
+            continue
+        p_up = core["prob_up"]
+        if 0.45 <= p_up <= 0.55:          # live NO-EDGE gate
+            skipped_no_edge += 1
+            continue
+        predicted = "U" if p_up >= 0.5 else "D"
+        won = 1 if predicted == dirs[i] else 0
+        bets += 1
+        wins += won
+        conf = p_up if predicted == "U" else 1 - p_up
+        for b in bins:
+            if b["lo"] <= conf < b["hi"]:
+                b["bets"] += 1
+                b["wins"] += won
+                break
+
+    win_rate = wins / bets if bets else 0.0
+    lo, hi = _wilson(wins, bets)
+    return {
+        "mode": mode,
+        "candle_source": candle_source,
+        "candle_count": n,
+        "bets": bets,
+        "wins": wins,
+        "win_rate": round(win_rate, 4),
+        "ci95_low": round(lo, 4),
+        "ci95_high": round(hi, 4),
+        "edge_confirmed": lo > 0.5,       # lower bound above 50% = significant
+        "skipped_no_edge": skipped_no_edge,
+        "skipped_no_direction": skipped_no_direction,
+        "by_confidence": [
+            {
+                "range": f"{int(b['lo']*100)}-{b['hi']*100:.1f}%",
+                "bets": b["bets"],
+                "wins": b["wins"],
+                "win_rate": round(b["wins"] / b["bets"], 4) if b["bets"] else None,
+            }
+            for b in bins
+        ],
+    }
 
 
 # ---------------------------------------------------------------------------

@@ -16,6 +16,7 @@ import { UpDownNodes } from './components/UpDownNodes';
 import { MarkovPanel } from './components/MarkovPanel';
 import { CandleStrip } from './components/CandleStrip';
 import { PerformancePanel } from './components/PerformancePanel';
+import { BacktestPanel } from './components/BacktestPanel';
 
 import { usePrice } from './hooks/usePrice';
 import { useMarkov } from './hooks/useMarkov';
@@ -301,6 +302,9 @@ export default function App() {
 
         {/* 10. Performance tracker */}
         <PerformancePanel stats={tracker.stats} activeTab={activeTab} />
+
+        {/* 11. Walk-forward backtest — edge estimate over full history */}
+        <BacktestPanel activeTab={activeTab} />
 
         <TouchableOpacity style={styles.clearBtn} onPress={tracker.clearHistory}>
           <Text style={styles.clearText}>Reset history</Text>
