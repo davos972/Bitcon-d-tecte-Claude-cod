@@ -18,6 +18,11 @@ frontend (Expo web statique) via le blueprint [`render.yaml`](render.yaml).
 4. Il demande les variables marquées `sync: false` :
    - **`CRYPTOCOMPARE_API_KEY`** → copie la valeur depuis `backend/.env` (local).
    - **`EXPO_PUBLIC_BACKEND_URL`** → laisse vide pour l'instant (étape 4).
+   - **`TRACKER_API_KEY`** (backend) **et** **`EXPO_PUBLIC_TRACKER_KEY`** (frontend)
+     → **la MÊME valeur** dans les deux (invente une longue chaîne aléatoire).
+     Protège l'écriture du tracker (POST/DELETE) contre les abus publics. Laissées
+     vides, l'écriture reste ouverte à tous — à éviter en prod. Changer la clé =
+     reconstruire le frontend (elle est intégrée au build).
 5. Lance la création. Le backend obtient un disque persistant monté sur `/data`
    (le tracker y est déjà dirigé via `TRACKER_DATA_DIR=/data`).
 

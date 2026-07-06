@@ -3,12 +3,13 @@ import json
 import logging
 import math
 import os
+import secrets
 import time
 from typing import Optional
 
 import httpx
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, Header, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -64,6 +65,26 @@ _RESULT_RANK = {"PENDING": 0, "EXPIRED": 1, "WIN": 2, "LOSS": 2}
 # timestamp after 2020-09-13). Guards the honest tracker against garbage/test
 # data — a single bad entry would corrupt the win-rate permanently.
 _MIN_WINDOW_START = 1_600_000_000
+
+# Write protection for the shared tracker (the backend is publicly hosted).
+# Enforcement is opt-in: only active when TRACKER_API_KEY is configured on the
+# server. GET stays open (non-sensitive); POST/DELETE then require the key via
+# the X-Api-Key header. NOTE: the frontend ships its copy in the JS bundle, so
+# this raises the bar (blocks scanners/casual abuse) but is not bulletproof
+# against someone who reads the bundle. The plausibility guard + per-request cap
+# below limit the damage a rogue write can do, and DELETE self-heals because
+# devices re-push their local history.
+TRACKER_API_KEY = os.getenv("TRACKER_API_KEY", "")
+
+# Anti-DoS: reject oversized sync payloads outright.
+_MAX_SYNC_ENTRIES = 10_000
+
+
+def _require_tracker_key(x_api_key: Optional[str]) -> None:
+    if not TRACKER_API_KEY:
+        return  # not configured → open (local dev)
+    if not x_api_key or not secrets.compare_digest(x_api_key, TRACKER_API_KEY):
+        raise HTTPException(status_code=401, detail="Invalid or missing API key")
 
 
 def _is_plausible(e) -> bool:
@@ -508,21 +529,9 @@ _CONF_BINS = [(0.55, 0.575), (0.575, 0.60), (0.60, 0.65), (0.65, 0.70), (0.70, 1
 _BACKTEST_MIN_HISTORY = 50
 
 
-@app.get("/api/backtest")
-async def api_backtest(mode: str = Query("15M", pattern="^(5M|15M|1H)$")):
-    """Walk-forward backtest: for each candle, predict it using ONLY the candles
-    before it (same engine as /api/markov), then compare to what actually
-    happened. Applies the live NO-EDGE gate (skip 0.45–0.55). Gives a large,
-    honest, out-of-sample estimate of the strategy's edge in one shot.
-
-    Caveat: idealised upper bound — ignores live timing/freshness and scores on
-    our own candles, not Polymarket resolution.
-    """
-    candles, candle_source = await _get_candles(mode)
-    if not candles or len(candles) <= _BACKTEST_MIN_HISTORY + 1:
-        raise HTTPException(status_code=503, detail="Not enough candle data for a backtest")
-
-    dirs = [_classify(c) for c in candles]
+def _run_backtest(dirs: list) -> dict:
+    """Pure CPU walk-forward loop (O(n^2)). Runs in a threadpool so it never
+    blocks the async event loop / other clients while it crunches."""
     n = len(dirs)
     bets = wins = skipped_no_edge = skipped_no_direction = 0
     bins = [{"lo": lo, "hi": hi, "bets": 0, "wins": 0} for lo, hi in _CONF_BINS]
@@ -550,8 +559,6 @@ async def api_backtest(mode: str = Query("15M", pattern="^(5M|15M|1H)$")):
     win_rate = wins / bets if bets else 0.0
     lo, hi = _wilson(wins, bets)
     return {
-        "mode": mode,
-        "candle_source": candle_source,
         "candle_count": n,
         "bets": bets,
         "wins": wins,
@@ -563,7 +570,7 @@ async def api_backtest(mode: str = Query("15M", pattern="^(5M|15M|1H)$")):
         "skipped_no_direction": skipped_no_direction,
         "by_confidence": [
             {
-                "range": f"{int(b['lo']*100)}-{b['hi']*100:.1f}%",
+                "range": f"{b['lo']*100:g}-{b['hi']*100:g}%",
                 "bets": b["bets"],
                 "wins": b["wins"],
                 "win_rate": round(b["wins"] / b["bets"], 4) if b["bets"] else None,
@@ -571,6 +578,28 @@ async def api_backtest(mode: str = Query("15M", pattern="^(5M|15M|1H)$")):
             for b in bins
         ],
     }
+
+
+@app.get("/api/backtest")
+async def api_backtest(mode: str = Query("15M", pattern="^(5M|15M|1H)$")):
+    """Walk-forward backtest: for each candle, predict it using ONLY the candles
+    before it (same engine as /api/markov), then compare to what actually
+    happened. Applies the live NO-EDGE gate (skip 0.45–0.55). Gives a large,
+    honest, out-of-sample estimate of the strategy's edge in one shot.
+
+    Caveat: idealised upper bound — ignores live timing/freshness and scores on
+    our own candles, not Polymarket resolution.
+    """
+    candles, candle_source = await _get_candles(mode)
+    if not candles or len(candles) <= _BACKTEST_MIN_HISTORY + 1:
+        raise HTTPException(status_code=503, detail="Not enough candle data for a backtest")
+
+    dirs = [_classify(c) for c in candles]
+    # Offload the O(n^2) crunch to a thread so we don't freeze other requests.
+    result = await asyncio.get_running_loop().run_in_executor(None, _run_backtest, dirs)
+    result["mode"] = mode
+    result["candle_source"] = candle_source
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -653,8 +682,14 @@ async def api_tracker_get():
 
 
 @app.post("/api/tracker")
-async def api_tracker_post(payload: TrackerSync):
+async def api_tracker_post(
+    payload: TrackerSync,
+    x_api_key: Optional[str] = Header(None, alias="X-Api-Key"),
+):
     """Merge the client's entries into the shared store and return the result."""
+    _require_tracker_key(x_api_key)
+    if len(payload.entries) > _MAX_SYNC_ENTRIES:
+        raise HTTPException(status_code=413, detail="Too many entries in one sync")
     async with _tracker_lock:
         merged = _merge_entries(_load_tracker(), payload.entries)
         _save_tracker(merged)
@@ -662,8 +697,11 @@ async def api_tracker_post(payload: TrackerSync):
 
 
 @app.delete("/api/tracker")
-async def api_tracker_delete():
+async def api_tracker_delete(
+    x_api_key: Optional[str] = Header(None, alias="X-Api-Key"),
+):
     """Clear the shared history (used by the 'Reset history' button)."""
+    _require_tracker_key(x_api_key)
     async with _tracker_lock:
         _save_tracker([])
         return {"entries": []}
