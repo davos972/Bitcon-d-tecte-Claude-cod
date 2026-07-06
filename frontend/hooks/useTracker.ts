@@ -3,10 +3,21 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { TimeFrame, CYCLE_SECONDS, getPolySlug, getWindowStart } from '../utils/cycle';
 
 const BACKEND = process.env.EXPO_PUBLIC_BACKEND_URL ?? 'http://localhost:8000';
+// Shared write key for the tracker (must match the backend TRACKER_API_KEY).
+// Sent on POST/DELETE only; empty in local dev = backend leaves writes open.
+const TRACKER_KEY = process.env.EXPO_PUBLIC_TRACKER_KEY ?? '';
+const writeHeaders = (): Record<string, string> => ({
+  'Content-Type': 'application/json',
+  ...(TRACKER_KEY ? { 'X-Api-Key': TRACKER_KEY } : {}),
+});
 const STORAGE_KEY = 'btc_markov_tracker_v1';
 const RECONCILE_INTERVAL_MS = 12_000;
 const POLY_GRACE_SECONDS = 30;
 const POLY_TIMEOUT_SECONDS = 720; // 12 minutes before falling back to local
+// A window with no close price captured (app was closed at the boundary) can
+// never be scored locally — mark it EXPIRED once this old instead of PENDING
+// forever (guide rule: never leave a prediction hanging).
+const LOCAL_EXPIRE_MINUTES = 30;
 
 export type PredictionResult = 'WIN' | 'LOSS' | 'EXPIRED' | 'PENDING';
 export type ResultSource = 'poly' | 'local';
@@ -138,7 +149,7 @@ async function pushServerEntries(
   try {
     const res = await fetch(`${BACKEND}/api/tracker`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: writeHeaders(),
       body: JSON.stringify({ entries }),
     });
     if (!res.ok) return null;
@@ -294,6 +305,11 @@ export function useTracker(): TrackerState {
                 resultSource: 'local',
               };
               changed = true;
+            } else if ((now - windowEnd) / 60 > LOCAL_EXPIRE_MINUTES) {
+              // No close price (app was closed at the boundary) → can't score.
+              // Mark EXPIRED instead of leaving it PENDING forever.
+              updated[i] = { ...entry, result: 'EXPIRED' };
+              changed = true;
             }
           }
         }
@@ -357,7 +373,7 @@ export function useTracker(): TrackerState {
   const clearHistory = useCallback(() => {
     applyEntries([], { push: false });
     // Clear the shared server store too, so every device resets — not just this one.
-    fetch(`${BACKEND}/api/tracker`, { method: 'DELETE' }).catch(() => {});
+    fetch(`${BACKEND}/api/tracker`, { method: 'DELETE', headers: writeHeaders() }).catch(() => {});
   }, []);
 
   const stats = computeStats(entries);

@@ -21,6 +21,9 @@ services:
         value: /data
       - key: CRYPTOCOMPARE_API_KEY
         sync: false          # à renseigner dans le dashboard (valeur de backend/.env)
+      - key: TRACKER_API_KEY
+        sync: false          # protège POST/DELETE /api/tracker — MÊME valeur que
+                             # EXPO_PUBLIC_TRACKER_KEY du frontend ci-dessous
 
   # ---- Frontend Expo web (statique) ---------------------------------------
   - type: web
@@ -34,6 +37,8 @@ services:
         value: "20"
       - key: EXPO_PUBLIC_BACKEND_URL
         sync: false          # = URL du backend Render (ex. https://btc-markov-backend.onrender.com)
+      - key: EXPO_PUBLIC_TRACKER_KEY
+        sync: false          # MÊME valeur que TRACKER_API_KEY du backend
     routes:
       - type: rewrite
         source: /*

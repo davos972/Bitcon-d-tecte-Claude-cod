@@ -185,6 +185,11 @@ export default function App() {
 
       if (p !== 'ANALYSIS') continue;
       if (m.status !== 'ok' || !m.data) continue;
+      // The Markov hook only refreshes its window every ~12s, unsynced to the
+      // boundary. Without this guard, in the first seconds of a new window `m`
+      // still holds the PREVIOUS window's (still-"fresh") prediction, which
+      // would get recorded under the new windowStart → polluted win-rate.
+      if (m.windowStart !== ws) continue;
       if (m.noEdge) continue;          // NO EDGE = nothing recorded (guide rule #4)
       if (!m.isFresh) continue;        // Stale prediction = never record (bug #9 fix)
       if (m.data.direction === 'NONE') continue;
