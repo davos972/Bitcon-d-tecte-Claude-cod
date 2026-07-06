@@ -43,6 +43,19 @@ premier lancement. Pour transférer d'un coup les ~228 prédictions déjà sur l
 demande-moi : je POST le contenu de `backend/tracker_store.json` (local) vers
 `…/api/tracker` de la prod (la fusion gère les doublons).
 
+## Tracker serveur 24/7 (Option B)
+Le backend enregistre **lui-même** les prédictions et les réconcilie contre
+Polymarket en tâche de fond, sans dépendre d'un onglet ouvert (le tracker
+frontend, lui, ne tourne que quand l'app est ouverte). L'historique s'accumule
+donc en continu, backend always-on oblige.
+- Activé par défaut (`TRACKER_SCHEDULER=1`). Mettre `0` pour revenir au
+  client-only.
+- Il applique exactement les mêmes règles que le frontend (fraîcheur, NO-EDGE,
+  résolution Polymarket, anti-doublon) ; serveur et clients écrivent la même
+  fenêtre sans conflit (fusion par `id`). Les entrées créées côté serveur
+  portent `recordedBy: "server"`.
+- Cadence 12 s ; démarre/s'arrête avec le cycle de vie de l'app (FastAPI lifespan).
+
 ## Notes
 - **Sécurité** : `CRYPTOCOMPARE_API_KEY` n'est jamais commitée (dans `.env`,
   gitignoré) — elle se renseigne uniquement dans le dashboard Render.
