@@ -24,6 +24,10 @@ services:
       - key: TRACKER_API_KEY
         sync: false          # protège POST/DELETE /api/tracker — MÊME valeur que
                              # EXPO_PUBLIC_TRACKER_KEY du frontend ci-dessous
+      - key: TRACKER_SCHEDULER
+        value: "1"           # tracker serveur autonome 24/7 (Option B) : le backend
+                             # enregistre + réconcilie les prédictions sans client
+                             # ouvert. Mettre "0" pour revenir au client-only.
 
   # ---- Frontend Expo web (statique) ---------------------------------------
   - type: web

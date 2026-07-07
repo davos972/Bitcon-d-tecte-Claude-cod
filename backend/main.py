@@ -5,6 +5,7 @@ import math
 import os
 import secrets
 import time
+from contextlib import asynccontextmanager
 from typing import Optional
 
 import httpx
@@ -27,7 +28,39 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="BTC Markov Predictor API")
+# Server-side autonomous tracker (Option B): record predictions + reconcile
+# results 24/7, independent of any open browser/app client. The frontend tracker
+# only runs while a tab is open, so history stalls whenever nobody has the app
+# up. This background scheduler removes that dependency. Enabled by default; set
+# TRACKER_SCHEDULER=0 to fall back to client-only recording.
+_SCHEDULER_ENABLED = os.getenv("TRACKER_SCHEDULER", "1") != "0"
+
+
+@asynccontextmanager
+async def _lifespan(_app: "FastAPI"):
+    """Start/stop the background tracker scheduler with the app lifecycle.
+
+    Uses lifespan (not @app.on_event) on purpose: the test suite instantiates
+    TestClient WITHOUT entering its context manager, so lifespan never fires in
+    tests → the scheduler makes no network calls during pytest.
+    """
+    task = None
+    if _SCHEDULER_ENABLED:
+        task = asyncio.create_task(_scheduler_loop())
+        logger.info("Server-side tracker scheduler: started")
+    try:
+        yield
+    finally:
+        if task is not None:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            logger.info("Server-side tracker scheduler: stopped")
+
+
+app = FastAPI(title="BTC Markov Predictor API", lifespan=_lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -640,6 +673,20 @@ def _resolve_market(market: Optional[dict]) -> Optional[str]:
     return None
 
 
+async def _fetch_poly_market(slug: str) -> Optional[dict]:
+    """Fetch the raw Gamma market dict for a slug (or None if not found).
+    Shared by the /api/poly_resolution endpoint and the background scheduler.
+    Raises on network error so each caller decides how to handle it."""
+    url = f"{GAMMA_API_BASE}/markets"
+    # Markets resolved by default are hidden → must pass closed=true
+    params = {"slug": slug, "closed": "true"}
+    async with httpx.AsyncClient(timeout=10.0) as c:
+        r = await c.get(url, params=params)
+        data = r.json()
+    markets = data if isinstance(data, list) else [data]
+    return markets[0] if markets else None
+
+
 @app.get("/api/poly_resolution")
 async def api_poly_resolution(slug: str = Query(...)):
     """
@@ -647,19 +694,12 @@ async def api_poly_resolution(slug: str = Query(...)):
     Slug format: btc-updown-5m-{ts} or btc-updown-15m-{ts}
     No 1H market exists on Polymarket → frontend handles that locally.
     """
-    url = f"{GAMMA_API_BASE}/markets"
-    # Markets resolved by default are hidden → must pass closed=true
-    params = {"slug": slug, "closed": "true"}
     try:
-        async with httpx.AsyncClient(timeout=10.0) as c:
-            r = await c.get(url, params=params)
-            data = r.json()
+        market = await _fetch_poly_market(slug)
     except Exception as exc:
         logger.error("Gamma API exception: %s", exc)
         raise HTTPException(status_code=503, detail="Gamma API unavailable")
 
-    markets = data if isinstance(data, list) else [data]
-    market = markets[0] if markets else None
     winner = _resolve_market(market)
 
     return {
@@ -710,3 +750,217 @@ async def api_tracker_delete(
 @app.get("/health")
 async def health():
     return {"status": "ok", "ts": int(time.time())}
+
+
+# ---------------------------------------------------------------------------
+# Server-side autonomous tracker scheduler (Option B)
+#
+# Mirrors the frontend tracker — the App.tsx recording loop + the useTracker
+# reconcile — but runs in the backend so the prediction history accumulates 24/7
+# without any open client. The decision logic is factored into PURE functions
+# (like _markov_core / _resolve_market) so it is unit-tested without network or
+# wall-clock. Entries use the exact same shape the frontend writes, so the two
+# merge by id (a client and the server can both record the same window safely).
+# ---------------------------------------------------------------------------
+
+_TRACKER_TFS = ("5M", "15M", "1H")
+_SCHEDULER_INTERVAL = 12          # seconds — same cadence as the client reconcile
+_POLY_GRACE_SECONDS = 30          # wait after close before scoring (resolution lag)
+_POLY_TIMEOUT_SECONDS = 720       # 12 min: fall back to local scoring if unresolved
+_LOCAL_EXPIRE_MINUTES = 30        # no price to score with this long → EXPIRED
+
+
+def _poly_slug(tf: str, window_start: int) -> Optional[str]:
+    """Deterministic Polymarket slug. 1H has no market → None (scored locally).
+    Must match the frontend getPolySlug exactly."""
+    if tf == "5M":
+        return f"btc-updown-5m-{window_start}"
+    if tf == "15M":
+        return f"btc-updown-15m-{window_start}"
+    return None
+
+
+def _prediction_is_recordable(core: Optional[dict], tf: str, window_start: int) -> bool:
+    """Pure gate mirroring the App.tsx guards: only record when the pattern is
+    fresh (uses the candle immediately before this window), has a real direction,
+    and is not NO-EDGE (0.45–0.55)."""
+    if not core:
+        return False
+    if core.get("last_closed_time") != window_start - CYCLE_SECONDS[tf]:
+        return False  # stale: previous candle not published yet → retry next tick
+    if core.get("direction") in (None, "NONE"):
+        return False
+    prob_up = core.get("prob_up")
+    if prob_up is None or 0.45 <= prob_up <= 0.55:
+        return False  # NO EDGE → record nothing (honesty rule #4)
+    return True
+
+
+def _build_prediction_entry(
+    tf: str, window_start: int, core: dict, price_at_open: float, now: int
+) -> dict:
+    """Build a PENDING tracker entry in the same shape the frontend writes, plus
+    recordedBy='server' for traceability (harmless extra field on merge)."""
+    return {
+        "id": f"{tf}-{window_start}",
+        "tf": tf,
+        "windowStart": window_start,
+        "direction": core["direction"],
+        "probUp": core["prob_up"],
+        "probDown": core["prob_down"],
+        "sampleSize": core["sample_size"],
+        "confidence": core["confidence"],
+        "priceAtOpen": price_at_open,
+        "recordedAt": now * 1000,
+        "result": "PENDING",
+        "recordedBy": "server",
+    }
+
+
+def _score_pending(
+    entry: dict, now: int, poly_winner: Optional[str], close_price: Optional[float]
+) -> Optional[dict]:
+    """Pure reconciliation for one PENDING entry. Returns an updated entry, or
+    None to leave it pending. Mirrors the useTracker reconcile branching:
+      - Polymarket verdict is authoritative for 5M/15M (resultSource 'poly').
+      - After a 12-min timeout (5M/15M) or after the grace period (1H), fall back
+        to local scoring against the closed candle (resultSource 'local').
+      - No price to score with after 30 min → EXPIRED (never left hanging).
+    `poly_winner`: winning outcome from Gamma, or None. `close_price`: close of
+    the window's candle, or None if not in history yet."""
+    tf = entry.get("tf")
+    ws = entry.get("windowStart")
+    if tf not in CYCLE_SECONDS or not isinstance(ws, (int, float)) or isinstance(ws, bool):
+        return None
+    ws = int(ws)
+    window_end = ws + CYCLE_SECONDS[tf]
+    if now < window_end + _POLY_GRACE_SECONDS:
+        return None
+
+    direction = entry.get("direction")
+    slug = _poly_slug(tf, ws)
+
+    # 1) Polymarket authoritative verdict (5M/15M)
+    if slug and poly_winner:
+        winner = str(poly_winner).lower()
+        predicted = str(direction).lower()
+        is_win = (predicted == "up" and winner == "up") or (
+            predicted == "down" and winner == "down"
+        )
+        return {**entry, "result": "WIN" if is_win else "LOSS", "resultSource": "poly"}
+
+    price_open = entry.get("priceAtOpen")
+
+    def _local(price_close: float) -> dict:
+        local_win = (direction == "UP" and price_close >= price_open) or (
+            direction == "DOWN" and price_close < price_open
+        )
+        return {
+            **entry,
+            "result": "WIN" if local_win else "LOSS",
+            "resultSource": "local",
+            "priceAtClose": price_close,
+        }
+
+    if slug:
+        # 5M/15M: only fall back to local after the Polymarket timeout.
+        if now > window_end + _POLY_TIMEOUT_SECONDS:
+            if close_price is not None and price_open is not None:
+                return _local(close_price)
+            if (now - window_end) / 60 > _LOCAL_EXPIRE_MINUTES:
+                return {**entry, "result": "EXPIRED"}
+        return None
+
+    # 1H: no Polymarket market → local scoring after the grace period.
+    if close_price is not None and price_open is not None:
+        return _local(close_price)
+    if (now - window_end) / 60 > _LOCAL_EXPIRE_MINUTES:
+        return {**entry, "result": "EXPIRED"}
+    return None
+
+
+async def _fetch_poly_winner(slug: str) -> Optional[str]:
+    """Scheduler-side wrapper: winning outcome for a slug, or None on any error
+    (the tick must never crash because Gamma hiccuped)."""
+    try:
+        market = await _fetch_poly_market(slug)
+    except Exception as exc:
+        logger.warning("Gamma API exception (scheduler) [%s]: %s", slug, exc)
+        return None
+    return _resolve_market(market)
+
+
+async def _scheduler_tick() -> None:
+    """One record + reconcile pass over all timeframes."""
+    now = int(time.time())
+
+    # Fetch candles once per TF (cached, ~10s TTL) and reuse for both phases.
+    candles_by_tf: dict = {}
+    for tf in _TRACKER_TFS:
+        candles, _src = await _get_candles(tf)
+        candles_by_tf[tf] = candles or []
+
+    async with _tracker_lock:
+        store = _load_tracker()
+    existing_ids = {e.get("id") for e in store}
+
+    changes: list = []
+
+    # ---- RECORD: at most one prediction per TF per window ----
+    for tf in _TRACKER_TFS:
+        cycle = CYCLE_SECONDS[tf]
+        ws = (now // cycle) * cycle
+        if f"{tf}-{ws}" in existing_ids:
+            continue  # anti-duplicate (rule #5)
+        candles = candles_by_tf[tf]
+        if not candles:
+            continue
+        closed = [c for c in candles if int(c["time"]) < ws]  # exclude forming candle
+        core = _compute_markov(closed)
+        if not _prediction_is_recordable(core, tf, ws):
+            continue
+        price_at_open = next(
+            (float(c["open"]) for c in candles if int(c["time"]) == ws), None
+        )
+        if price_at_open is None:
+            continue  # current candle not in history yet → retry next tick
+        changes.append(_build_prediction_entry(tf, ws, core, price_at_open, now))
+
+    # ---- RECONCILE: score every PENDING entry whose window has closed ----
+    for entry in store:
+        if entry.get("result") != "PENDING":
+            continue
+        tf = entry.get("tf")
+        ws = entry.get("windowStart")
+        if tf not in CYCLE_SECONDS or not isinstance(ws, (int, float)) or isinstance(ws, bool):
+            continue
+        ws = int(ws)
+        if now < ws + CYCLE_SECONDS[tf] + _POLY_GRACE_SECONDS:
+            continue  # not closed + grace yet — cheap pre-filter before any Gamma call
+        slug = _poly_slug(tf, ws)
+        poly_winner = await _fetch_poly_winner(slug) if slug else None
+        candle = next((c for c in candles_by_tf.get(tf, []) if int(c["time"]) == ws), None)
+        close_price = float(candle["close"]) if candle is not None else None
+        updated = _score_pending(entry, now, poly_winner, close_price)
+        if updated is not None:
+            changes.append(updated)
+
+    if changes:
+        async with _tracker_lock:
+            merged = _merge_entries(_load_tracker(), changes)
+            _save_tracker(merged)
+        recorded = sum(1 for c in changes if c.get("result") == "PENDING")
+        logger.info("Scheduler: +%d recorded, %d scored", recorded, len(changes) - recorded)
+
+
+async def _scheduler_loop() -> None:
+    """Run _scheduler_tick forever; never dies on a transient error."""
+    await asyncio.sleep(5)  # let the app finish starting / warm the candle cache
+    while True:
+        try:
+            await _scheduler_tick()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.error("Scheduler tick failed: %s", exc)
+        await asyncio.sleep(_SCHEDULER_INTERVAL)
